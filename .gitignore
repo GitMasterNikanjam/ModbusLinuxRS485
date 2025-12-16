@@ -1,0 +1,16 @@
+.vscode/
+LOG.txt
+build/
+bin/
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Object files
+*.o
+*.obj
+
+
+
