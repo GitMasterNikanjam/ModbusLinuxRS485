@@ -97,7 +97,7 @@ class Modbus
          *
          * @return true if the serial port file descriptor is valid.
          */
-        bool isPortOpen() const { return _serialPort >= 0; }
+        bool isPortOpen();
 
         // -------------------------------------------------------------------------
         // Modbus Read Operations
@@ -142,6 +142,8 @@ class Modbus
          * @return Vector containing ONLY the data bytes (big-endian).
          */
         std::vector<uint8_t> readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+
+        bool readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer);
 
         /**
          * @brief Read input registers (Function Code 0x04).

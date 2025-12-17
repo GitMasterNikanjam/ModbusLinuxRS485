@@ -118,6 +118,11 @@ bool Modbus::openPort(void)
     return true;
 }
 
+bool Modbus::isPortOpen() 
+{ 
+    return (_serialPort >= 0); 
+}
+
 bool Modbus::_serialSend(const std::vector<uint8_t>& data)
 {
     if (!isPortOpen()) 
@@ -267,10 +272,30 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     return std::vector<uint8_t>(response.begin() + 3, response.end() - 2);
 }
 
-// Writes a 16-bit value to a single holding register (Function Code 0x06)
+bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer)
+{
+    std::vector<uint8_t> data_vec;
+    data_vec = readHoldingRegisters(slaveID, starting_address, num_registers);
+    if(data_vec.size() != (num_registers * 2))
+    {
+        return false;
+    }
+
+    for(uint8_t i = 0; i < num_registers; i++)
+    {
+        buffer[i] = ( (static_cast<uint16_t>(data_vec[2*i]) << 8) | static_cast<uint16_t>(data_vec[2*i + 1]) );
+    }    
+    
+    return true;
+}
+
 bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uint16_t value) 
 {
-    if (!isPortOpen()) return false;
+    if (!isPortOpen()) 
+    {
+        errorMessage = "Modbus port is closed.";
+        return false;
+    }
 
     // 1. Modbus uses 0-based addressing (Manual Register 40030 -> 0x001D)
     uint16_t address_0based = starting_address - 40001; 
@@ -294,7 +319,10 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     // std::cout << "Sending Write Command: ";
     // printHex(request_data);
 
-    if (!_serialSend(request_data)) return false;
+    if (!_serialSend(request_data)) 
+    {
+        return false;
+    }
 
     // 4. Receive Response (Function 06 echoes the request back exactly)
     size_t expected_length = 8; 
