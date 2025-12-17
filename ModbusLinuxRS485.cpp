@@ -3,6 +3,13 @@
 // Include libraries:
 
 #include "ModbusLinuxRS485.h"
+#include <fcntl.h>              // For file control (open, close)
+#include <unistd.h>             // For read, write, sleep, usleep
+#include <errno.h>              // For error numbers
+#include <sstream>
+#include <stdexcept>            // For runtime_error
+#include <iomanip>
+#include <termios.h>            // For terminal control (termios struct, baud rates)
 
 // ################################################################################
 // Define macros:
@@ -11,16 +18,6 @@
 
 // ################################################################################
 // Helper functions:
-
-// --- Helper function to print byte vectors in hex format ---
-void print_hex(const std::vector<uint8_t>& data) 
-{
-    for (const auto& byte : data) 
-    {
-        std::cout << "{" << std::hex << std::setw(2) << std::setfill('0') << (int)byte << "}";
-    }
-    std::cout << std::dec << std::endl;
-}
 
 // --- CRC-16 (Modbus) Calculation Function ---
 uint16_t calculate_crc16(const std::vector<uint8_t>& data) 
@@ -73,9 +70,9 @@ bool Modbus::openPort(void)
     {
         case 9600: baud_rate = B9600; break;
         case 19200: baud_rate = B19200; break;
-        case 38400: baud_rate = B19200; break;
-        case 57600: baud_rate = B19200; break;
-        case 115200: baud_rate = B19200; break;
+        case 38400: baud_rate = B38400; break;
+        case 57600: baud_rate = B57600; break;
+        case 115200: baud_rate = B115200; break;
         default: 
             errorMessage = "Baud rate is not valid.";
             return false;
@@ -194,6 +191,7 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
         std::ostringstream oss;
         oss << "ERROR: Invalid number of registers (" << num_registers << ").";
         errorMessage = oss.str();
+        
         return {};
     }
 
@@ -216,9 +214,6 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low Byte
     request_data.push_back((uint8_t)(crc >> 8));  // CRC High Byte
 
-    std::cout << "Sending Command: ";
-    print_hex(request_data);
-
     if (!_serialSend(request_data)) return {};
 
     // 3. Calculate Expected Response Length: ID(1), Func(1), ByteCnt(1), Data(2*N), CRC(2)
@@ -227,26 +222,33 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     // 4. Receive Response
     std::vector<uint8_t> response = _serialReceive(expected_length);
 
-    if (response.size() != expected_length) {
-        std::cerr << "ERROR: Incomplete response (Expected " << expected_length 
-                << " bytes, Received " << response.size() << " bytes)." << std::endl;
+    if (response.size() != expected_length) 
+    {
+        std::ostringstream oss;
+        oss << "ERROR: Incomplete response (Expected " << expected_length 
+                << " bytes, Received " << response.size() << " bytes).";
+        errorMessage = oss.str();
+        
         return {};
     }
-
-    std::cout << "Received Response: ";
-    print_hex(response);
 
     // 5. Basic Validation and Error Check
     if (response[0] != slaveID) 
     {
-        std::cerr << "ERROR: Slave ID mismatch." << std::endl;
+        std::ostringstream oss;
+        oss << "ERROR: Slave ID mismatch.";
+        errorMessage = oss.str();
+
         return {};
     }
 
     // Check for exception response (Function code + 0x80)
     if (response[1] == (0x03 | 0x80)) 
     { 
-        std::cerr << "ERROR: Modbus Exception Code 0x" << std::hex << (int)response[2] << std::dec << std::endl;
+        std::ostringstream oss;
+        oss << "ERROR: Modbus Exception Code 0x" << std::hex << (int)response[2] << std::dec;
+        errorMessage = oss.str();
+
         // Refer to manual for exception codes (e.g., 0x02 = Illegal Data Address)
         return {};
     }
@@ -254,7 +256,10 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     // Check function code and byte count
     if (response[1] != 0x03 || response[2] != (uint8_t)(num_registers * 2)) 
     {
-        std::cerr << "ERROR: Response format error (Func Code: " << (int)response[1] << ", Byte Count: " << (int)response[2] << ")." << std::endl;
+        std::ostringstream oss;
+        oss << "ERROR: Response format error (Func Code: " << (int)response[1] << ", Byte Count: " << (int)response[2] << ").";
+        errorMessage = oss.str();
+
         return {};
     }
 
@@ -262,3 +267,132 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     return std::vector<uint8_t>(response.begin() + 3, response.end() - 2);
 }
 
+// Writes a 16-bit value to a single holding register (Function Code 0x06)
+bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uint16_t value) 
+{
+    if (!isPortOpen()) return false;
+
+    // 1. Modbus uses 0-based addressing (Manual Register 40030 -> 0x001D)
+    uint16_t address_0based = starting_address - 40001; 
+
+    // 2. Build the Modbus Request (6 bytes + 2 CRC)
+    std::vector<uint8_t> request_data = 
+    {
+        slaveID,
+        0x06,                           // Function Code: 06 (Write Single Register)
+        (uint8_t)(address_0based >> 8),
+        (uint8_t)(address_0based & 0xFF),
+        (uint8_t)(value >> 8),
+        (uint8_t)(value & 0xFF)
+    };
+
+    // 3. Append CRC-16
+    uint16_t crc = calculate_crc16(request_data);
+    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low
+    request_data.push_back((uint8_t)(crc >> 8));   // CRC High
+
+    // std::cout << "Sending Write Command: ";
+    // printHex(request_data);
+
+    if (!_serialSend(request_data)) return false;
+
+    // 4. Receive Response (Function 06 echoes the request back exactly)
+    size_t expected_length = 8; 
+    std::vector<uint8_t> response = _serialReceive(expected_length);
+
+    if (response.size() != expected_length) 
+    {
+        std::ostringstream oss;
+        oss << "ERROR: Write response timeout or incomplete.";
+        errorMessage = oss.str();
+
+        return false;
+    }
+
+    // 5. Validation: A successful write returns the same data sent
+    if (response[1] == (0x06 | 0x80)) 
+    {
+        std::ostringstream oss;
+        oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
+        errorMessage = oss.str();
+
+        return false;
+    }
+
+    // std::cout << "Write Successful!" << std::endl;
+
+    return true;
+}
+
+bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const std::vector<uint16_t>& values) 
+{
+    if (!isPortOpen() || values.empty()) return false;
+
+    uint16_t num_registers = values.size();
+    uint16_t address_0based = starting_address - 40001; 
+
+    // 1. Build the Modbus Request Header
+    std::vector<uint8_t> request_data = 
+    {
+        slaveID,
+        0x10,                           // Function Code: 0x10 (Write Multiple Registers)
+        (uint8_t)(address_0based >> 8),
+        (uint8_t)(address_0based & 0xFF),
+        (uint8_t)(num_registers >> 8),
+        (uint8_t)(num_registers & 0xFF),
+        (uint8_t)(num_registers * 2)    // Byte Count (2 bytes per register)
+    };
+
+    // 2. Append the Register Data (Big Endian)
+    for (uint16_t val : values) 
+    {
+        request_data.push_back((uint8_t)(val >> 8));
+        request_data.push_back((uint8_t)(val & 0xFF));
+    }
+
+    // 3. Append CRC-16
+    uint16_t crc = calculate_crc16(request_data);
+    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low
+    request_data.push_back((uint8_t)(crc >> 8));   // CRC High
+
+    // std::cout << "Sending Write Multiple: ";
+    // printHex(request_data);
+
+    if (!_serialSend(request_data)) return false;
+
+    // 4. Receive Response (8 bytes for Function 0x10)
+    // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
+    size_t expected_length = 8; 
+    std::vector<uint8_t> response = _serialReceive(expected_length);
+
+    if (response.size() != expected_length) 
+    {
+        std::ostringstream oss;
+        oss << "ERROR: Multi-write response timeout.";
+        errorMessage = oss.str();
+
+        return false;
+    }
+
+    // 5. Validation: Check for Modbus Exceptions
+    if (response[1] == (0x10 | 0x80)) 
+    {
+        std::ostringstream oss;
+        oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
+        errorMessage = oss.str();
+
+        return false;
+    }
+
+    // std::cout << "Multi-Register Write Successful!" << std::endl;
+    return true;
+}
+
+void Modbus::printHex(const std::vector<uint8_t>& data) 
+{
+    for (const auto& byte : data) 
+    {
+        std::cout << "{" << std::hex << std::setw(2) << std::setfill('0') << (int)byte << "}";
+    }
+    std::cout << std::dec << std::endl;
+}
