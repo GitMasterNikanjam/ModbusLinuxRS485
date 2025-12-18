@@ -143,6 +143,19 @@ class Modbus
          */
         std::vector<uint8_t> readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
 
+        /**
+         * @brief Read holding registers (Function Code 0x03).
+         *
+         * Holding registers are read/write registers typically used for
+         * configuration parameters or output values.
+         *
+         * @param slaveID Modbus slave address.
+         * @param starting_address First register address (zero-based).
+         * @param num_registers Number of registers to read.
+         * @param buffer Array pointer to store ONLY the data registers (big-endian).
+         *
+         * @return true on success.
+         */
         bool readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer);
 
         /**
@@ -215,6 +228,20 @@ class Modbus
          */
         bool writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const std::vector<uint16_t>& values);
 
+        /**
+         * @brief Write multiple holding registers (Function Code 0x10).
+         *
+         * Writes multiple consecutive 16-bit values to holding registers.
+         *
+         * @param slaveID Modbus slave address.
+         * @param starting_address First register address (zero-based).
+         * @param num_registers Number of registers in values array.
+         * @param values Array of 16-bit values to write.
+         *
+         * @return true on success.
+         */
+        bool writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, const uint16_t* values);
+
         // -------------------------------------------------------------------------
         // Utility
         // -------------------------------------------------------------------------
@@ -247,6 +274,16 @@ class Modbus
         bool _serialSend(const std::vector<uint8_t>& data);
 
         /**
+         * @brief Send raw data over the serial port.
+         *
+         * @param num is number of elemnts in data array.
+         * @param data array containing the full Modbus RTU frame.
+         * 
+         * @return true if transmission succeeded.
+         */
+        bool _serialSend(size_t length, const uint8_t* data);
+
+        /**
          * @brief Receive raw data from the serial port.
          *
          * @param expected_length Expected number of bytes to receive.
@@ -254,6 +291,16 @@ class Modbus
          * @return Vector containing received bytes.
          */
         std::vector<uint8_t> _serialReceive(size_t expected_length); 
+
+        /**
+         * @brief Receive raw data from the serial port.
+         *
+         * @param expected_length Expected number of bytes to receive.
+         * @param buffer pointer to store received bytes.
+         * 
+         * @return number of read data.
+         */
+        size_t _serialReceive(size_t expected_length, uint8_t* buffer);
 };
 
 // ##############################################################################
