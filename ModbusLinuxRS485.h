@@ -38,6 +38,8 @@ class Modbus
          */
         std::string errorMessage; 
 
+        enum class Parity : uint8_t { None, Even, Odd };
+
         /**
          * @struct ParametersStructure
          * @brief Serial communication configuration parameters.
@@ -59,14 +61,22 @@ class Modbus
             uint32_t BAUDRATE;
 
             /**
-             * @brief Inter-frame transmit delay in microseconds.
+             * @brief Inter-frame transmit delay in microseconds. [us]
              *
              * This delay is applied after sending a Modbus request to allow
              * the slave device sufficient processing and response time.
              *
              * @note Required for some slow or heavily loaded slaves.
              */
-            uint32_t TRANSMIT_DELAY;
+            uint32_t TRANSMIT_DELAY_US;
+
+            // Total response timeout for a complete RTU response
+            uint32_t    RESPONSE_TIMEOUT_MS {1000};
+
+            // Serial format (common Modbus RTU defaults are 8E1 or 8N1)
+            Parity      PARITY {Parity::None};
+            uint8_t     STOP_BITS {1};   // 1 or 2
+            uint8_t     DATA_BITS {8};   // typically 8
         }parameters;
 
         /**
@@ -92,12 +102,14 @@ class Modbus
          */
         bool openPort(void);
 
+        void closePort();
+
         /**
          * @brief Check whether the serial port is open.
          *
          * @return true if the serial port file descriptor is valid.
          */
-        bool isPortOpen();
+        bool isPortOpen() const;
 
         // -------------------------------------------------------------------------
         // Modbus Read Operations
@@ -114,7 +126,7 @@ class Modbus
          *
          * @return Vector containing raw response data bytes.
          */
-        std::vector<uint8_t> ReadCoils(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+        std::vector<uint8_t> readCoils(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read discrete inputs (Function Code 0x02).
@@ -127,7 +139,7 @@ class Modbus
          *
          * @return Vector containing raw response data bytes.
          */
-        std::vector<uint8_t> ReadDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+        std::vector<uint8_t> readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read holding registers (Function Code 0x03).
@@ -141,7 +153,7 @@ class Modbus
          *
          * @return Vector containing ONLY the data bytes (big-endian).
          */
-        std::vector<uint8_t> readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+        std::vector<uint8_t> readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
 
         /**
          * @brief Read holding registers (Function Code 0x03).
@@ -156,7 +168,7 @@ class Modbus
          *
          * @return true on success.
          */
-        bool readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer);
+        bool readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity, uint16_t* buffer);
 
         /**
          * @brief Read input registers (Function Code 0x04).
@@ -170,7 +182,9 @@ class Modbus
          *
          * @return Vector containing raw response data bytes.
          */
-        std::vector<uint8_t> ReadInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+        std::vector<uint8_t> readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity);
+
+        bool readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity, uint16_t* out);
 
         // -------------------------------------------------------------------------
         // Modbus Write Operations
@@ -187,7 +201,7 @@ class Modbus
          *
          * @return true on success.
          */
-        bool WriteSingleCoil(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+        bool writeSingleCoil(uint8_t slaveID, uint16_t address, bool state);
 
         /**
          * @brief Write a single holding register (Function Code 0x06).
@@ -200,7 +214,7 @@ class Modbus
          *
          * @return true on success.
          */
-        bool writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uint16_t value);
+        bool writeSingleRegister(uint8_t slaveID, uint16_t address, uint16_t value);
 
         /**
          * @brief Write multiple coils (Function Code 0x0F).
@@ -213,7 +227,7 @@ class Modbus
          *
          * @return true on success.
          */
-        bool WriteMultipleCoils(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers);
+        bool writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, const std::vector<bool>& values);
 
         /**
          * @brief Write multiple holding registers (Function Code 0x10).
@@ -240,7 +254,7 @@ class Modbus
          *
          * @return true on success.
          */
-        bool writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, const uint16_t* values);
+        bool writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity, const uint16_t* values);
 
         // -------------------------------------------------------------------------
         // Utility
@@ -264,6 +278,16 @@ class Modbus
          */
         int _serialPort;
 
+        uint16_t _crc16_modbus(const std::vector<uint8_t>& data);
+        static uint16_t _crc16_modbus(const uint8_t* data, size_t len);
+        static bool     _verifyCrc(const std::vector<uint8_t>& frame);
+        static void _appendCrc(std::vector<uint8_t>& frame);
+
+        static uint16_t _normalizeHoldingRegisterAddress(uint16_t addr);
+        static uint16_t _normalizeInputRegisterAddress(uint16_t addr);
+        static uint16_t _normalizeCoilAddress(uint16_t addr);
+        static uint16_t _normalizeDiscreteInputAddress(uint16_t addr);
+
         /**
          * @brief Send raw data over the serial port.
          *
@@ -281,16 +305,19 @@ class Modbus
          * 
          * @return true if transmission succeeded.
          */
-        bool _serialSend(size_t length, const uint8_t* data);
+        bool _serialSend(const uint8_t* data, size_t len);
 
-        /**
-         * @brief Receive raw data from the serial port.
-         *
-         * @param expected_length Expected number of bytes to receive.
-         *
-         * @return Vector containing received bytes.
-         */
-        std::vector<uint8_t> _serialReceive(size_t expected_length); 
+        // /**
+        //  * @brief Receive raw data from the serial port.
+        //  *
+        //  * @param expected_length Expected number of bytes to receive.
+        //  *
+        //  * @return Vector containing received bytes.
+        //  */
+        // std::vector<uint8_t> _serialReceive(size_t expected_length); 
+
+        // Reads exactly n bytes (unless timeout); returns empty on failure and sets errorMessage.
+        std::vector<uint8_t> _serialReceive(size_t n, uint32_t timeout_ms = 1000);
 
         /**
          * @brief Receive raw data from the serial port.
@@ -301,6 +328,13 @@ class Modbus
          * @return number of read data.
          */
         size_t _serialReceive(size_t expected_length, uint8_t* buffer);
+
+        // Reads Modbus RTU response for:
+        // - fixed length responses (write single/multiple)
+        // - variable length responses where byte-count is in the 3rd byte (read regs/coils)
+        std::vector<uint8_t> _receiveRtuResponse(uint8_t expected_slave, uint8_t expected_function, size_t expected_fixed_len, uint32_t timeout_ms);
+
+        bool _validateBasicResponse(const std::vector<uint8_t>& resp, uint8_t expected_slave, uint8_t expected_function);
 };
 
 // ##############################################################################
