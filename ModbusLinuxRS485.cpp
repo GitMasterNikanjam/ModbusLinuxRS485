@@ -10,7 +10,12 @@
 #include <stdexcept>            // For runtime_error
 #include <iomanip>
 #include <termios.h>            // For terminal control (termios struct, baud rates)
+#include <chrono>
 #include <poll.h>
+#include <iostream>
+#include <cstring>
+#include <algorithm>
+#include <utility>     // for std::move
 
 // ################################################################################
 // Modbus class:
@@ -20,24 +25,51 @@
 // ------------------------
 
 Modbus::Modbus()
-{
+{   
+    errorMessage.clear();
+
     parameters.PORT = "";
     parameters.BAUDRATE = 9600;
-    parameters.TRANSMIT_DELAY_US = 3000;
+    parameters.TRANSMIT_DELAY_US = 0;
+    parameters.RESPONSE_TIMEOUT_MS = 1000;
+    parameters.PARITY = Parity::None;
+    parameters.STOP_BITS = 1;
+    parameters.DATA_BITS = 8;
 
     _serialPort = -1;
+}
+
+Modbus::Modbus(Modbus&& other) noexcept
+{
+    errorMessage = std::move(other.errorMessage);
+    parameters   = other.parameters;
+    _serialPort  = other._serialPort;
+    other._serialPort = -1;
+}
+
+Modbus& Modbus::operator=(Modbus&& other) noexcept
+{
+    if (this == &other) return *this;
+
+    closePort(); // safe cleanup
+
+    errorMessage = std::move(other.errorMessage);
+    parameters   = other.parameters;
+    _serialPort  = other._serialPort;
+    other._serialPort = -1;
+    return *this;
 }
 
 Modbus::~Modbus()
 {
     if (_serialPort >= 0) 
     {
-        close(_serialPort);
+        ::close(_serialPort);
         _serialPort = -1;
     }
 }
 
-void Modbus::closePort()
+void Modbus::closePort() noexcept
 {
     if (_serialPort >= 0)
     {
@@ -46,7 +78,7 @@ void Modbus::closePort()
     }
 }
 
-bool Modbus::isPortOpen() const
+bool Modbus::isPortOpen() const noexcept
 { 
     return (_serialPort >= 0); 
 }
@@ -57,6 +89,12 @@ bool Modbus::isPortOpen() const
 
 bool Modbus::openPort(void)
 {
+    if (parameters.PORT.empty())
+    {
+        errorMessage = "Serial PORT is empty.";
+        return false;
+    }
+
     speed_t baud_rate;
     switch (parameters.BAUDRATE) 
     {
@@ -71,7 +109,7 @@ bool Modbus::openPort(void)
     }
 
     // Initialization code remains the same as the working version
-    _serialPort = open(parameters.PORT.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+    _serialPort = open(parameters.PORT.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (_serialPort < 0) 
     {
         std::ostringstream oss;
@@ -88,13 +126,56 @@ bool Modbus::openPort(void)
     cfsetospeed(&tty, baud_rate);
     cfsetispeed(&tty, baud_rate);
 
-    tty.c_cflag &= ~PARENB; tty.c_cflag &= ~CSTOPB; tty.c_cflag &= ~CSIZE; tty.c_cflag |= CS8;
-    tty.c_cflag |= CREAD | CLOCAL; 
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~CSIZE;
+
+    // Data bits
+    switch (parameters.DATA_BITS)
+    {
+        case 5: tty.c_cflag |= CS5; break;
+        case 6: tty.c_cflag |= CS6; break;
+        case 7: tty.c_cflag |= CS7; break;
+        case 8: tty.c_cflag |= CS8; break;
+        default:
+            errorMessage = "Invalid DATA_BITS (must be 5..8).";
+            ::close(_serialPort); _serialPort = -1;
+            return false;
+    }
+
+    // Stop bits
+    if (parameters.STOP_BITS == 2) tty.c_cflag |= CSTOPB;
+    else if (parameters.STOP_BITS == 1) tty.c_cflag &= ~CSTOPB;
+    else
+    {
+        errorMessage = "Invalid STOP_BITS (must be 1 or 2).";
+        ::close(_serialPort); _serialPort = -1;
+        return false;
+    }
+
+    // Parity
+    tty.c_cflag &= ~(PARENB | PARODD);
+    switch (parameters.PARITY)
+    {
+        case Parity::None:
+            // nothing
+            break;
+        case Parity::Even:
+            tty.c_cflag |= PARENB;
+            break;
+        case Parity::Odd:
+            tty.c_cflag |= PARENB;
+            tty.c_cflag |= PARODD;
+            break;
+    }
+
     tty.c_lflag = 0; tty.c_oflag = 0; 
 
-    // VMIN=1 (wait for first byte), VTIME=10 (1 second timeout for subsequent bytes)
-    tty.c_cc[VMIN]  = 1; 
-    tty.c_cc[VTIME] = (cc_t)(parameters.RESPONSE_TIMEOUT_MS / 100.0); 
+    // // VMIN=1 (wait for first byte), VTIME=10 (1 second timeout for subsequent bytes)
+    // tty.c_cc[VMIN]  = 1; 
+    // tty.c_cc[VTIME] = (cc_t)(parameters.RESPONSE_TIMEOUT_MS / 100.0); 
+
+    tty.c_cc[VMIN]  = 0;
+    tty.c_cc[VTIME] = 0;
 
     if (tcsetattr(_serialPort, TCSANOW, &tty) != 0) 
     {
@@ -102,8 +183,18 @@ bool Modbus::openPort(void)
         oss << "Error setting port attributes: " << strerror(errno);
         errorMessage = oss.str();
 
-        close(_serialPort); 
+        ::close(_serialPort); 
         _serialPort = -1; 
+        return false;
+    }
+
+    if (tcgetattr(_serialPort, &tty) != 0)
+    {
+        std::ostringstream oss;
+        oss << "Error getting port attributes: " << std::strerror(errno);
+        errorMessage = oss.str();
+        ::close(_serialPort);
+        _serialPort = -1;
         return false;
     }
 
@@ -127,18 +218,24 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
         return false;
     }
 
-    // Flush any stale input before a request.
+    // Flush stale input before request (OK for Modbus RTU).
     tcflush(_serialPort, TCIFLUSH); 
     tcdrain(_serialPort); 
 
-    ssize_t n = write(_serialPort, data, len);
-    if (n < 0 || (size_t)n != len) 
+    size_t sent = 0;
+    while (sent < len)
     {
-        std::ostringstream oss;
-        oss << "Error writing data: " << strerror(errno);
-        errorMessage = oss.str();
-
-        return false;
+        ssize_t n = ::write(_serialPort, data + sent, len - sent);
+        if (n < 0)
+        {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN) { ::usleep(1000); continue; } // tiny backoff
+            std::ostringstream oss;
+            oss << "write failed: " << std::strerror(errno);
+            errorMessage = oss.str();
+            return false;
+        }
+        sent += static_cast<size_t>(n);
     }
 
     // Ensure request is physically transmitted before turnaround delay.
@@ -152,68 +249,31 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
     return true;
 }
 
-// std::vector<uint8_t> Modbus::_serialReceive(size_t expected_length)
-// {
-//     if (!isPortOpen()) 
-//     {
-//         errorMessage = "Receive failed, port is closed.";
-//         return {};
-//     }
-
-//     std::vector<uint8_t> buffer(expected_length);
-
-//     // This single call blocks until VMIN bytes or VTIME timeout occurs
-//     ssize_t n = read(_serialPort, buffer.data(), expected_length);
-
-//     if (n > 0) 
-//     {
-//         buffer.resize(n); 
-//         return buffer;
-//     } 
-//     else if (n == 0) 
-//     {
-//         std::ostringstream oss;
-//         oss << "Timeout during serial read (VTIME expired).";
-//         errorMessage = oss.str();
-//     } 
-//     else 
-//     {
-//         std::ostringstream oss;
-//         oss << "Error reading serial data: " << strerror(errno);
-//         errorMessage = oss.str();
-//     }
-
-//     return {};
-// }
-
 size_t Modbus::_serialReceive(size_t expected_length, uint8_t* buffer)
 {
-if (!isPortOpen()) 
+    if (!isPortOpen())
     {
         errorMessage = "Receive failed, port is closed.";
         return 0;
     }
 
-    // This single call blocks until VMIN bytes or VTIME timeout occurs
-    ssize_t n = read(_serialPort, buffer, expected_length);
+    ssize_t n = ::read(_serialPort, buffer, expected_length);
 
-    if (n > 0) 
+    if (n > 0) return static_cast<size_t>(n);
+
+    if (n == 0)
     {
-        return n;
-    } 
-    else if (n == 0) 
-    {
-        std::ostringstream oss;
-        oss << "Timeout during serial read (VTIME expired).";
-        errorMessage = oss.str();
-    } 
-    else 
-    {
-        std::ostringstream oss;
-        oss << "Error reading serial data: " << strerror(errno);
-        errorMessage = oss.str();
+        errorMessage = "Serial read returned 0 bytes.";
+        return 0;
     }
 
+    // n < 0
+    if (errno == EINTR) return 0; // caller may retry
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; // no data yet (non-blocking)
+
+    std::ostringstream oss;
+    oss << "Error reading serial data: " << std::strerror(errno);
+    errorMessage = oss.str();
     return 0;
 }
 
@@ -229,12 +289,27 @@ std::vector<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
     out.reserve(n);
 
     const int fd = _serialPort;
-    int remaining_timeout = static_cast<int>(timeout_ms);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
     while (out.size() < n)
     {
-        pollfd pfd{fd, POLLIN, 0};
-        const int rc = ::poll(&pfd, 1, remaining_timeout);
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+        {
+            std::ostringstream oss;
+            oss << "Timeout while reading (" << timeout_ms << " ms total).";
+            errorMessage = oss.str();
+            return {};
+        }
+
+        int remaining = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+
+        int rc = ::poll(&pfd, 1, remaining);
         if (rc == 0)
         {
             std::ostringstream oss;
@@ -251,27 +326,28 @@ std::vector<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
             return {};
         }
 
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+        {
+            errorMessage = "Serial port error/hangup while reading.";
+            return {};
+        }
+
         uint8_t buf[256];
         const size_t want = std::min(sizeof(buf), n - out.size());
-        const ssize_t got = ::read(fd, buf, want);
+
+        ssize_t got = ::read(fd, buf, want);
         if (got < 0)
         {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN) continue;
             std::ostringstream oss;
             oss << "read failed: " << std::strerror(errno);
             errorMessage = oss.str();
             return {};
         }
-        if (got == 0)
-        {
-            // Shouldn't happen with poll(POLLIN), but handle defensively.
-            continue;
-        }
+        if (got == 0) continue;
 
         out.insert(out.end(), buf, buf + got);
-        // remaining_timeout: we keep total timeout, not per-chunk
-        // poll() already consumed time; easiest is to re-poll with same remaining_timeout.
-        // A more precise implementation could track elapsed time with clock_gettime.
     }
 
     return out;
@@ -384,7 +460,20 @@ std::vector<uint8_t> Modbus::readCoils(uint8_t slaveID, uint16_t starting_addres
     _appendCrc(req);
 
     if (!_serialSend(req)) return {};
-    return _receiveRtuResponse(slaveID, 0x01, 0, parameters.RESPONSE_TIMEOUT_MS);
+
+    auto resp = _receiveRtuResponse(slaveID, 0x01, 0, parameters.RESPONSE_TIMEOUT_MS);
+    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+
+    const uint8_t byteCount = resp[2];
+    const size_t expectedByteCount = (quantity + 7u) / 8u;
+    if (byteCount != expectedByteCount)
+    {
+        errorMessage = "Byte-count mismatch in response.";
+        return {};
+    }
+
+    // return ONLY data bytes
+    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 std::vector<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t starting_address, uint16_t quantity)
@@ -402,7 +491,19 @@ std::vector<uint8_t> Modbus::readDiscreteInputs(uint8_t slaveID, uint16_t starti
     _appendCrc(req);
 
     if (!_serialSend(req)) return {};
-    return _receiveRtuResponse(slaveID, 0x02, 0, parameters.RESPONSE_TIMEOUT_MS);
+
+    auto resp = _receiveRtuResponse(slaveID, 0x02, 0, parameters.RESPONSE_TIMEOUT_MS);
+    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+
+    const uint8_t byteCount = resp[2];
+    const size_t expectedByteCount = (quantity + 7u) / 8u;
+    if (byteCount != expectedByteCount)
+    {
+        errorMessage = "Byte-count mismatch in response.";
+        return {};
+    }
+
+    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
@@ -423,6 +524,17 @@ bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
 
     // Function 05 echoes the request (8 bytes)
     auto resp = _receiveRtuResponse(slaveID, 0x05, 8, parameters.RESPONSE_TIMEOUT_MS);
+
+    if (resp.empty()) return false;
+
+    const uint16_t raddr = (static_cast<uint16_t>(resp[2]) << 8) | resp[3];
+    const uint16_t rval  = (static_cast<uint16_t>(resp[4]) << 8) | resp[5];
+    if (raddr != addr || rval != val)
+    {
+        errorMessage = "0x05 echo mismatch.";
+        return false;
+    }
+
     return !resp.empty();
 }
 
@@ -445,7 +557,7 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
 
     // 1. Build the Modbus Request (6 bytes)
     // Modbus 4XXXX registers use 0-based addressing (40001 -> 0x0000)
-    uint16_t address_0based = starting_address - 40001; 
+    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     std::vector<uint8_t> request_data = 
     {
@@ -468,7 +580,7 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
     size_t expected_length = 5 + (size_t)num_registers * 2; 
 
     // 4. Receive Response
-    std::vector<uint8_t> response = _serialReceive(expected_length);
+    std::vector<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
     if (response.size() != expected_length) 
     {
@@ -477,6 +589,12 @@ std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t star
                 << " bytes, Received " << response.size() << " bytes).";
         errorMessage = oss.str();
         
+        return {};
+    }
+
+    if (!_verifyCrc(response))
+    {
+        errorMessage = "CRC mismatch in response.";
         return {};
     }
 
@@ -534,7 +652,7 @@ bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, ui
 
     // 1. Build the Modbus Request (6 bytes)
     // Modbus 4XXXX registers use 0-based addressing (40001 -> 0x0000)
-    uint16_t address_0based = starting_address - 40001; 
+    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     std::vector<uint8_t> request_data = 
     {
@@ -557,17 +675,21 @@ bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, ui
     size_t expected_length = 5 + (size_t)num_registers * 2; 
 
     // 4. Receive Response
-    // std::vector<uint8_t> response = _serialReceive(expected_length);
-    uint8_t response[expected_length];
-    size_t nRead = _serialReceive(expected_length, response);
+    auto response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
-    if (nRead != expected_length) 
+    if (response.size() != expected_length) 
     {
         std::ostringstream oss;
         oss << "ERROR: Incomplete response (Expected " << expected_length 
-                << " bytes, Received " << nRead << " bytes).";
+                << " bytes, Received " << response.size() << " bytes).";
         errorMessage = oss.str();
         
+        return false;
+    }
+
+    if (!_verifyCrc(response))
+    {
+        errorMessage = "CRC mismatch in response.";
         return false;
     }
 
@@ -603,10 +725,12 @@ bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, ui
     }
 
     // 6. Extract and Return ONLY the data bytes
-    for(uint8_t i = 0; i < num_registers; i++)
+    for (uint16_t i = 0; i < num_registers; ++i)
     {
-        buffer[i] = ( (static_cast<uint16_t>(response[2*i]) << 8) | static_cast<uint16_t>(response[2*i + 1]) );
-    } 
+        const size_t off = 3 + 2*i;
+        buffer[i] = (static_cast<uint16_t>(response[off]) << 8) |
+                    static_cast<uint16_t>(response[off + 1]);
+    }
 
     return true;
 }
@@ -627,21 +751,38 @@ std::vector<uint8_t> Modbus::readInputRegisters(uint8_t slaveID, uint16_t starti
 
     if (!_serialSend(req)) return {};
 
-    return _receiveRtuResponse(slaveID, 0x04, 0, parameters.RESPONSE_TIMEOUT_MS);
+    auto resp = _receiveRtuResponse(slaveID, 0x04, 0, parameters.RESPONSE_TIMEOUT_MS);
+    if (resp.empty()) return {};
+    // resp = [id][fc][byteCount][data...][crc][crc]
+    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
+
+    const uint8_t byteCount = resp[2];
+    if (byteCount != quantity * 2)
+    {
+        errorMessage = "Byte-count mismatch in response.";
+        return {};
+    }
+
+    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 bool Modbus::readInputRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t quantity, uint16_t* out)
 {
     if (!out) { errorMessage = "Output buffer is null."; return false; }
-    auto resp = readInputRegisters(slaveID, starting_address, quantity);
-    if (resp.empty()) return false;
+    if (quantity == 0 || quantity > 125) { errorMessage = "Invalid quantity (1..125)."; return false; }
 
-    const uint8_t byteCount = resp[2];
-    if (byteCount != quantity * 2) { errorMessage = "Byte-count mismatch in response."; return false; }
+    auto data = readInputRegisters(slaveID, starting_address, quantity);
+    if (data.size() != static_cast<size_t>(quantity) * 2)
+    {
+        errorMessage = "Input register data length mismatch.";
+        return false;
+    }
 
     for (uint16_t i = 0; i < quantity; ++i)
-        out[i] = static_cast<uint16_t>(resp[3 + 2*i] << 8) | resp[3 + 2*i + 1];
-
+    {
+        out[i] = (static_cast<uint16_t>(data[2*i]) << 8) |
+                 static_cast<uint16_t>(data[2*i + 1]);
+    }
     return true;
 }
 
@@ -654,7 +795,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     }
 
     // 1. Modbus uses 0-based addressing (Manual Register 40030 -> 0x001D)
-    uint16_t address_0based = starting_address - 40001; 
+    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     // 2. Build the Modbus Request (6 bytes + 2 CRC)
     std::vector<uint8_t> request_data = 
@@ -682,26 +823,43 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
 
     // 4. Receive Response (Function 06 echoes the request back exactly)
     size_t expected_length = 8; 
-    std::vector<uint8_t> response = _serialReceive(expected_length);
+    std::vector<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
-    if (response.size() != expected_length) 
+    if (response.size() != expected_length)
     {
-        std::ostringstream oss;
-        oss << "ERROR: Write response timeout or incomplete.";
-        errorMessage = oss.str();
-
+        errorMessage = "ERROR: Write response timeout or incomplete.";
         return false;
     }
 
-    // 5. Validation: A successful write returns the same data sent
-    if (response[1] == (0x06 | 0x80)) 
+    if (!_verifyCrc(response))
+    {
+        errorMessage = "CRC mismatch in response.";
+        return false;
+    }
+
+    // Exception first
+    if (response[1] == (0x06 | 0x80))
     {
         std::ostringstream oss;
         oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
         errorMessage = oss.str();
-
         return false;
     }
+
+    if (response[0] != slaveID || response[1] != 0x06)
+    {
+        errorMessage = "Write single register response header mismatch.";
+        return false;
+    }
+
+    const uint16_t raddr = (static_cast<uint16_t>(response[2]) << 8) | response[3];
+    const uint16_t rval  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    if (raddr != address_0based || rval != value)
+    {
+        errorMessage = "0x06 echo mismatch.";
+        return false;
+    }
+
 
     // std::cout << "Write Successful!" << std::endl;
 
@@ -745,7 +903,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     if (!isPortOpen() || values.empty()) return false;
 
     uint16_t num_registers = values.size();
-    uint16_t address_0based = starting_address - 40001; 
+    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     // 1. Build the Modbus Request Header
     std::vector<uint8_t> request_data = 
@@ -779,24 +937,32 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     // 4. Receive Response (8 bytes for Function 0x10)
     // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
     size_t expected_length = 8; 
-    std::vector<uint8_t> response = _serialReceive(expected_length);
+    auto response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
-    if (response.size() != expected_length) 
+    if (response.size() != expected_length)
     {
-        std::ostringstream oss;
-        oss << "ERROR: Multi-write response timeout.";
-        errorMessage = oss.str();
-
+        errorMessage = "ERROR: Multi-write response timeout.";
         return false;
     }
 
-    // 5. Validation: Check for Modbus Exceptions
-    if (response[1] == (0x10 | 0x80)) 
+    if (!_verifyCrc(response))
+    {
+        errorMessage = "CRC mismatch in response.";
+        return false;
+    }
+
+    // Exception first
+    if (response[1] == (0x10 | 0x80))
     {
         std::ostringstream oss;
         oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
         errorMessage = oss.str();
+        return false;
+    }
 
+    if (response[0] != slaveID || response[1] != 0x10)
+    {
+        errorMessage = "0x10 response header mismatch.";
         return false;
     }
 
@@ -808,7 +974,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 {
     if (!isPortOpen() || (values == nullptr)) return false;
 
-    uint16_t address_0based = starting_address - 40001; 
+    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
 
     // 1. Build the Modbus Request Header
     std::vector<uint8_t> request_data = 
@@ -842,24 +1008,32 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     // 4. Receive Response (8 bytes for Function 0x10)
     // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
     size_t expected_length = 8; 
-    std::vector<uint8_t> response = _serialReceive(expected_length);
+    auto response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
-    if (response.size() != expected_length) 
+    if (response.size() != expected_length)
     {
-        std::ostringstream oss;
-        oss << "ERROR: Multi-write response timeout.";
-        errorMessage = oss.str();
-
+        errorMessage = "ERROR: Multi-write response timeout.";
         return false;
     }
 
-    // 5. Validation: Check for Modbus Exceptions
-    if (response[1] == (0x10 | 0x80)) 
+    if (!_verifyCrc(response))
+    {
+        errorMessage = "CRC mismatch in response.";
+        return false;
+    }
+
+    // Exception first
+    if (response[1] == (0x10 | 0x80))
     {
         std::ostringstream oss;
         oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
         errorMessage = oss.str();
+        return false;
+    }
 
+    if (response[0] != slaveID || response[1] != 0x10)
+    {
+        errorMessage = "0x10 response header mismatch.";
         return false;
     }
 

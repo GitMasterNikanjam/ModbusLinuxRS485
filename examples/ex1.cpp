@@ -3,57 +3,64 @@ mkdir -p ./bin && g++ ex1.cpp ../*.cpp -o ./bin/ex1
 sudo ./bin/ex1
 */
 
-// #############################################################################
-// Include libraries:
-
 #include "../ModbusLinuxRS485.h"
+#include <iostream>
+#include <vector>
+#include <cstdint>
 
-// #############################################################################
-// Parameters:
+#define DEVICE_PORT   "/dev/ttyS1"
+#define BAUD_RATE     115200
+#define SLAVE_ID      1
 
-#define DEVICE_PORT             "/dev/ttyS1"    // Confirmed working port
-#define BAUD_RATE               115200         // Confirmed working baud rate
-#define SLAVE_ID                1               // Confirmed working Slave ID
-
-// ############################################################################
-// --- Main Execution ---
-
-int main() 
+int main()
 {
     Modbus modbus;
     modbus.parameters.PORT = DEVICE_PORT;
     modbus.parameters.BAUDRATE = BAUD_RATE;
-    modbus.parameters.TRANSMIT_DELAY = 3000;
+    modbus.parameters.TRANSMIT_DELAY_US = 3000;   // <-- FIX: correct field name (microseconds)
 
-    std::cout << "Attempting to open port " << DEVICE_PORT << "..." << std::endl;
-    if(modbus.openPort() == false)
+    std::cout << "Attempting to open port " << DEVICE_PORT << "...\n";
+    if (!modbus.openPort())
     {
-        std::cerr << "\nFATAL: Could not open serial port." << std::endl;
-        std::cout << modbus.errorMessage << std::endl;
-        return -1;
+        std::cerr << "FATAL: Could not open serial port.\n";
+        std::cerr << modbus.errorMessage << "\n";
+        return 1;
     }
 
-    std::vector<uint8_t> response = modbus.readHoldingRegisters(SLAVE_ID, 40351, 2);
+    // Read 2 holding registers starting at 40351
+    auto response = modbus.readHoldingRegisters(SLAVE_ID, 40351, 2);
 
-    if (response.size() > 0) 
+    if (!response.empty())
     {
-        std::cout << "Received Response: ";
+        std::cout << "Received data bytes: ";
         modbus.printHex(response);
+
+        if (response.size() == 4)
+        {
+            uint16_t r0 = (uint16_t(response[0]) << 8) | response[1];
+            uint16_t r1 = (uint16_t(response[2]) << 8) | response[3];
+            std::cout << "Decoded: r0=" << r0 << " r1=" << r1 << "\n";
+        }
+    }
+    else
+    {
+        std::cerr << "Read failed: " << modbus.errorMessage << "\n";
     }
 
-    int32_t absolute_pulses;
-    std::vector<uint16_t> registers;
-    
-    absolute_pulses = -1000;
-    registers = 
-    {  
-        (uint16_t)((uint32_t)absolute_pulses >> 16),    // Register 40126: High Word
-        (uint16_t)((uint32_t)absolute_pulses & 0xFFFF)  // Register 40127: Low Word
+    // Write -1000 as signed 32-bit across 2 registers (high word, low word)
+    int32_t absolute_pulses = 10000;
+    uint32_t u = static_cast<uint32_t>(absolute_pulses);
+
+    std::vector<uint16_t> regs = {
+        static_cast<uint16_t>((u >> 16) & 0xFFFF),
+        static_cast<uint16_t>(u & 0xFFFF)
     };
 
-    modbus.writeMultipleRegisters(SLAVE_ID, 40351, registers);
+    if (!modbus.writeMultipleRegisters(SLAVE_ID, 40351, regs))
+        std::cerr << "WriteMultipleRegisters failed: " << modbus.errorMessage << "\n";
 
-    modbus.writeSingleRegister(SLAVE_ID, 40125, 0X67);
+    if (!modbus.writeSingleRegister(SLAVE_ID, 40125, 0x0067))
+        std::cerr << "WriteSingleRegister failed: " << modbus.errorMessage << "\n";
 
     return 0;
 }
