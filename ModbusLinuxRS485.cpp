@@ -18,6 +18,15 @@
 #include <utility>     // for std::move
 
 // ################################################################################
+
+static inline uint64_t now_ms()
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + ts.tv_nsec / 1000000ULL;
+}
+
+// ################################################################################
 // Modbus class:
 
 // ------------------------
@@ -129,6 +138,9 @@ bool Modbus::openPort(void)
     tty.c_cflag |= (CLOCAL | CREAD);
     tty.c_cflag &= ~CSIZE;
 
+    // no hw flow control
+    tty.c_cflag &= ~CRTSCTS;
+
     // Data bits
     switch (parameters.DATA_BITS)
     {
@@ -169,6 +181,16 @@ bool Modbus::openPort(void)
     }
 
     tty.c_lflag = 0; tty.c_oflag = 0; 
+
+    // raw-ish input
+    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP |
+                    INLCR | IGNCR | ICRNL | IXON | IXOFF | IXANY);
+
+    // raw-ish output
+    tty.c_oflag &= ~OPOST;
+
+    // raw-ish local
+    tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
 
     // // VMIN=1 (wait for first byte), VTIME=10 (1 second timeout for subsequent bytes)
     // tty.c_cc[VMIN]  = 1; 
@@ -309,6 +331,7 @@ std::vector<uint8_t> Modbus::_serialReceive(size_t n, uint32_t timeout_ms)
         }
 
         int remaining = (int)std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        if (remaining <= 0) remaining = 1;
 
         pollfd pfd{};
         pfd.fd = fd;
@@ -399,24 +422,44 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
                                                 size_t expected_fixed_len,
                                                 uint32_t timeout_ms)
 {
+    const uint64_t deadline_ms = now_ms() + (uint64_t)timeout_ms;
+
+    auto remaining_ms = [&]() -> uint32_t
+    {
+        uint64_t now = now_ms();
+        if (now >= deadline_ms) return 0;
+        uint64_t rem = deadline_ms - now;
+        if (rem > 0xFFFFFFFFULL) rem = 0xFFFFFFFFULL;
+        return (uint32_t)rem;
+    };
+
     // For read functions, expected_fixed_len = 0; we will read header to compute full len.
     // For write echoes/acks, expected_fixed_len is known (usually 8).
     if (expected_fixed_len != 0)
     {
-        auto resp = _serialReceive(expected_fixed_len, timeout_ms);
+        uint32_t rem = remaining_ms();
+        if (rem == 0) { errorMessage = "Timeout before reading fixed response."; return {}; }
+
+        auto resp = _serialReceive(expected_fixed_len, rem);
         if (resp.empty()) return {};
         if (!_validateBasicResponse(resp, expected_slave, expected_function)) return {};
         return resp;
     }
 
+    uint32_t rem = remaining_ms();
+    if (rem == 0) { errorMessage = "Timeout waiting for response header."; return {}; }
+
     // Variable-length: read first 2 bytes to detect exception, then 3rd byte (byte-count) for normal response.
-    auto first2 = _serialReceive(2, timeout_ms);
-    if (first2.empty()) return {};
+    auto first2 = _serialReceive(2, rem);
+    if (first2.size() != 2) return {};
 
     // If function indicates exception, read remaining 3 bytes (exc code + CRC2) => total 5 bytes
     if (first2.size() == 2 && first2[1] == static_cast<uint8_t>(expected_function | 0x80))
     {
-        auto rest3 = _serialReceive(3, timeout_ms);
+        rem = remaining_ms();
+        if (rem == 0) { errorMessage = "Timeout waiting for exception tail."; return {}; }
+
+        auto rest3 = _serialReceive(3, rem);
         if (rest3.empty()) return {};
         std::vector<uint8_t> resp;
         resp.reserve(5);
@@ -428,12 +471,20 @@ std::vector<uint8_t> Modbus::_receiveRtuResponse(uint8_t expected_slave,
     }
 
     // Normal response: need 3rd byte = byte count
-    auto third = _serialReceive(1, timeout_ms);
+
+    rem = remaining_ms();
+    if (rem == 0) { errorMessage = "Timeout waiting for byteCount."; return {}; }
+
+    auto third = _serialReceive(1, rem);
     if (third.empty()) return {};
     const uint8_t byteCount = third[0];
 
     // Remaining = byteCount data + CRC2
-    auto rest = _serialReceive(static_cast<size_t>(byteCount) + 2, timeout_ms);
+
+    rem = remaining_ms();
+    if (rem == 0) { errorMessage = "Timeout waiting for data/CRC."; return {}; }
+
+    auto rest = _serialReceive(static_cast<size_t>(byteCount) + 2, rem);
     if (rest.empty()) return {};
 
     std::vector<uint8_t> resp;
@@ -545,198 +596,60 @@ bool Modbus::writeSingleCoil(uint8_t slaveID, uint16_t address, bool on)
 
 std::vector<uint8_t> Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers)
 {
-    if (!isPortOpen()) 
-    {
-        errorMessage = "Read failed. Port is closed.";
-        return {};
-    }
-
-    if (num_registers == 0 || num_registers > 125) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Invalid number of registers (" << num_registers << ").";
-        errorMessage = oss.str();
-        
-        return {};
-    }
+    if (!isPortOpen()) { errorMessage = "Read failed. Port is closed."; return {}; }
+    if (num_registers == 0 || num_registers > 125) { errorMessage = "Invalid quantity (1..125)."; return {}; }
 
     // 1. Build the Modbus Request (6 bytes)
     // Modbus 4XXXX registers use 0-based addressing (40001 -> 0x0000)
-    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
+    const uint16_t addr = _normalizeHoldingRegisterAddress(starting_address);
 
-    std::vector<uint8_t> request_data = 
+    std::vector<uint8_t> req
     {
-        slaveID,
-        0x03,                           // Function Code: 03 (Read Holding Registers)
-        (uint8_t)(address_0based >> 8),
-        (uint8_t)(address_0based & 0xFF),
-        (uint8_t)(num_registers >> 8),
-        (uint8_t)(num_registers & 0xFF)
+        slaveID, 0x03,
+        static_cast<uint8_t>(addr >> 8), static_cast<uint8_t>(addr & 0xFF),
+        static_cast<uint8_t>(num_registers >> 8), static_cast<uint8_t>(num_registers & 0xFF)
     };
 
     // 2. Calculate and Append CRC-16
-    uint16_t crc = _crc16_modbus(request_data);
-    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low Byte
-    request_data.push_back((uint8_t)(crc >> 8));  // CRC High Byte
+    _appendCrc(req);
 
-    if (!_serialSend(request_data)) return {};
+    if (!_serialSend(req)) return {};
 
-    // 3. Calculate Expected Response Length: ID(1), Func(1), ByteCnt(1), Data(2*N), CRC(2)
-    size_t expected_length = 5 + (size_t)num_registers * 2; 
+    // Variable-length RTU response (handles exception frames properly)
+    auto resp = _receiveRtuResponse(slaveID, 0x03, 0, parameters.RESPONSE_TIMEOUT_MS);
+    if (resp.empty()) return {};
 
-    // 4. Receive Response
-    std::vector<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
+    if (resp.size() < 5) { errorMessage = "Response too short."; return {}; }
 
-    if (response.size() != expected_length) 
+    const uint8_t byteCount = resp[2];
+    if (byteCount != static_cast<uint8_t>(num_registers * 2))
     {
-        std::ostringstream oss;
-        oss << "ERROR: Incomplete response (Expected " << expected_length 
-                << " bytes, Received " << response.size() << " bytes).";
-        errorMessage = oss.str();
-        
+        errorMessage = "Byte-count mismatch in response.";
         return {};
     }
 
-    if (!_verifyCrc(response))
-    {
-        errorMessage = "CRC mismatch in response.";
-        return {};
-    }
-
-    // 5. Basic Validation and Error Check
-    if (response[0] != slaveID) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Slave ID mismatch.";
-        errorMessage = oss.str();
-
-        return {};
-    }
-
-    // Check for exception response (Function code + 0x80)
-    if (response[1] == (0x03 | 0x80)) 
-    { 
-        std::ostringstream oss;
-        oss << "ERROR: Modbus Exception Code 0x" << std::hex << (int)response[2] << std::dec;
-        errorMessage = oss.str();
-
-        // Refer to manual for exception codes (e.g., 0x02 = Illegal Data Address)
-        return {};
-    }
-
-    // Check function code and byte count
-    if (response[1] != 0x03 || response[2] != (uint8_t)(num_registers * 2)) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Response format error (Func Code: " << (int)response[1] << ", Byte Count: " << (int)response[2] << ").";
-        errorMessage = oss.str();
-
-        return {};
-    }
-
-    // 6. Extract and Return ONLY the data bytes
-    return std::vector<uint8_t>(response.begin() + 3, response.end() - 2);
+    // return ONLY data bytes
+    return std::vector<uint8_t>(resp.begin() + 3, resp.end() - 2);
 }
 
 bool Modbus::readHoldingRegisters(uint8_t slaveID, uint16_t starting_address, uint16_t num_registers, uint16_t* buffer)
 {
-    if (!isPortOpen()) 
+    if (!buffer) { errorMessage = "Output buffer is null."; return false; }
+    if (!isPortOpen()) { errorMessage = "Read failed. Port is closed."; return false; }
+    if (num_registers == 0 || num_registers > 125) { errorMessage = "Invalid quantity (1..125)."; return false; }
+
+    auto data = readHoldingRegisters(slaveID, starting_address, num_registers);
+    if (data.size() != static_cast<size_t>(num_registers) * 2)
     {
-        errorMessage = "Read failed. Port is closed.";
+        errorMessage = "Holding register data length mismatch.";
         return false;
     }
 
-    if (num_registers == 0 || num_registers > 125) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Invalid number of registers (" << num_registers << ").";
-        errorMessage = oss.str();
-        
-        return false;
-    }
-
-    // 1. Build the Modbus Request (6 bytes)
-    // Modbus 4XXXX registers use 0-based addressing (40001 -> 0x0000)
-    uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
-
-    std::vector<uint8_t> request_data = 
-    {
-        slaveID,
-        0x03,                           // Function Code: 03 (Read Holding Registers)
-        (uint8_t)(address_0based >> 8),
-        (uint8_t)(address_0based & 0xFF),
-        (uint8_t)(num_registers >> 8),
-        (uint8_t)(num_registers & 0xFF)
-    };
-
-    // 2. Calculate and Append CRC-16
-    uint16_t crc = _crc16_modbus(request_data);
-    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low Byte
-    request_data.push_back((uint8_t)(crc >> 8));  // CRC High Byte
-
-    if (!_serialSend(request_data)) return false;
-
-    // 3. Calculate Expected Response Length: ID(1), Func(1), ByteCnt(1), Data(2*N), CRC(2)
-    size_t expected_length = 5 + (size_t)num_registers * 2; 
-
-    // 4. Receive Response
-    auto response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
-
-    if (response.size() != expected_length) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Incomplete response (Expected " << expected_length 
-                << " bytes, Received " << response.size() << " bytes).";
-        errorMessage = oss.str();
-        
-        return false;
-    }
-
-    if (!_verifyCrc(response))
-    {
-        errorMessage = "CRC mismatch in response.";
-        return false;
-    }
-
-    // 5. Basic Validation and Error Check
-    if (response[0] != slaveID) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Slave ID mismatch.";
-        errorMessage = oss.str();
-
-        return false;
-    }
-
-    // Check for exception response (Function code + 0x80)
-    if (response[1] == (0x03 | 0x80)) 
-    { 
-        std::ostringstream oss;
-        oss << "ERROR: Modbus Exception Code 0x" << std::hex << (int)response[2] << std::dec;
-        errorMessage = oss.str();
-
-        // Refer to manual for exception codes (e.g., 0x02 = Illegal Data Address)
-        return false;
-    }
-
-    // Check function code and byte count
-    if (response[1] != 0x03 || response[2] != (uint8_t)(num_registers * 2)) 
-    {
-        std::ostringstream oss;
-        oss << "ERROR: Response format error (Func Code: " << (int)response[1] << ", Byte Count: " << (int)response[2] << ").";
-        errorMessage = oss.str();
-
-        return false;
-    }
-
-    // 6. Extract and Return ONLY the data bytes
     for (uint16_t i = 0; i < num_registers; ++i)
     {
-        const size_t off = 3 + 2*i;
-        buffer[i] = (static_cast<uint16_t>(response[off]) << 8) |
-                    static_cast<uint16_t>(response[off + 1]);
+        buffer[i] = (static_cast<uint16_t>(data[2*i]) << 8) |
+                    static_cast<uint16_t>(data[2*i + 1]);
     }
-
     return true;
 }
 
@@ -814,9 +727,7 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     };
 
     // 3. Append CRC-16
-    uint16_t crc = _crc16_modbus(request_data);
-    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low
-    request_data.push_back((uint8_t)(crc >> 8));   // CRC High
+    _appendCrc(request_data);
 
     // std::cout << "Sending Write Command: ";
     // printHex(request_data);
@@ -827,36 +738,43 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     }
 
     // 4. Receive Response (Function 06 echoes the request back exactly)
-    size_t expected_length = 8; 
-    std::vector<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
+    // ✅ Use RTU receiver so exception frames (5 bytes) don't cause a timeout hang.
 
-    if (response.size() != expected_length)
-    {
-        errorMessage = "ERROR: Write response timeout or incomplete.";
-        return false;
-    }
+    // size_t expected_length = 8; 
+    // std::vector<uint8_t> response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
 
-    if (!_verifyCrc(response))
-    {
-        errorMessage = "CRC mismatch in response.";
-        return false;
-    }
+    // if (response.size() != expected_length)
+    // {
+    //     errorMessage = "ERROR: Write response timeout or incomplete.";
+    //     return false;
+    // }
 
-    // Exception first
-    if (response[1] == (0x06 | 0x80))
-    {
-        std::ostringstream oss;
-        oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
-        errorMessage = oss.str();
-        return false;
-    }
+    auto response = _receiveRtuResponse(slaveID, 0x06, 8, parameters.RESPONSE_TIMEOUT_MS);
+    if (response.empty()) return false;   // errorMessage already set
 
-    if (response[0] != slaveID || response[1] != 0x06)
-    {
-        errorMessage = "Write single register response header mismatch.";
-        return false;
-    }
 
+    // if (!_verifyCrc(response))
+    // {
+    //     errorMessage = "CRC mismatch in response.";
+    //     return false;
+    // }
+
+    // // Exception first
+    // if (response[1] == (0x06 | 0x80))
+    // {
+    //     std::ostringstream oss;
+    //     oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
+    //     errorMessage = oss.str();
+    //     return false;
+    // }
+
+    // if (response[0] != slaveID || response[1] != 0x06)
+    // {
+    //     errorMessage = "Write single register response header mismatch.";
+    //     return false;
+    // }
+
+    // Extra echo validation (optional but good)
     const uint16_t raddr = (static_cast<uint16_t>(response[2]) << 8) | response[3];
     const uint16_t rval  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
     if (raddr != address_0based || rval != value)
@@ -905,7 +823,8 @@ bool Modbus::writeMultipleCoils(uint8_t slaveID, uint16_t starting_address, cons
 
 bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, const std::vector<uint16_t>& values) 
 {
-    if (!isPortOpen() || values.empty()) return false;
+    if (!isPortOpen()) { errorMessage = "Port is closed."; return false; }
+    if (values.empty() || values.size() > 123) { errorMessage = "Invalid quantity (1..123)."; return false; }
 
     uint16_t num_registers = values.size();
     uint16_t address_0based = _normalizeHoldingRegisterAddress(starting_address);
@@ -930,9 +849,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     }
 
     // 3. Append CRC-16
-    uint16_t crc = _crc16_modbus(request_data);
-    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low
-    request_data.push_back((uint8_t)(crc >> 8));   // CRC High
+    _appendCrc(request_data);
 
     // std::cout << "Sending Write Multiple: ";
     // printHex(request_data);
@@ -941,33 +858,16 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 
     // 4. Receive Response (8 bytes for Function 0x10)
     // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
-    size_t expected_length = 8; 
-    auto response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
+    // ✅ Use RTU receiver so exception frames (5 bytes) don't cause a timeout hang.
+    auto response = _receiveRtuResponse(slaveID, 0x10, 8, parameters.RESPONSE_TIMEOUT_MS);
+    if (response.empty()) return false;
 
-    if (response.size() != expected_length)
+    // Optional: validate echo fields (addr + qty)
+    const uint16_t raddr = (static_cast<uint16_t>(response[2]) << 8) | response[3];
+    const uint16_t rqty  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    if (raddr != address_0based || rqty != num_registers)
     {
-        errorMessage = "ERROR: Multi-write response timeout.";
-        return false;
-    }
-
-    if (!_verifyCrc(response))
-    {
-        errorMessage = "CRC mismatch in response.";
-        return false;
-    }
-
-    // Exception first
-    if (response[1] == (0x10 | 0x80))
-    {
-        std::ostringstream oss;
-        oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
-        errorMessage = oss.str();
-        return false;
-    }
-
-    if (response[0] != slaveID || response[1] != 0x10)
-    {
-        errorMessage = "0x10 response header mismatch.";
+        errorMessage = "0x10 response echo mismatch.";
         return false;
     }
 
@@ -1001,9 +901,7 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
     }
 
     // 3. Append CRC-16
-    uint16_t crc = _crc16_modbus(request_data);
-    request_data.push_back((uint8_t)(crc & 0xFF)); // CRC Low
-    request_data.push_back((uint8_t)(crc >> 8));   // CRC High
+    _appendCrc(request_data);
 
     // std::cout << "Sending Write Multiple: ";
     // printHex(request_data);
@@ -1012,33 +910,15 @@ bool Modbus::writeMultipleRegisters(uint8_t slaveID, uint16_t starting_address, 
 
     // 4. Receive Response (8 bytes for Function 0x10)
     // Response format: [ID][0x10][AddrH][AddrL][QtyH][QtyL][CRCL][CRCH]
-    size_t expected_length = 8; 
-    auto response = _serialReceive(expected_length, parameters.RESPONSE_TIMEOUT_MS);
+    auto response = _receiveRtuResponse(slaveID, 0x10, 8, parameters.RESPONSE_TIMEOUT_MS);
+    if (response.empty()) return false;
 
-    if (response.size() != expected_length)
+    // Optional: validate echo fields (addr + qty)
+    const uint16_t raddr = (static_cast<uint16_t>(response[2]) << 8) | response[3];
+    const uint16_t rqty  = (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    if (raddr != address_0based || rqty != num_registers)
     {
-        errorMessage = "ERROR: Multi-write response timeout.";
-        return false;
-    }
-
-    if (!_verifyCrc(response))
-    {
-        errorMessage = "CRC mismatch in response.";
-        return false;
-    }
-
-    // Exception first
-    if (response[1] == (0x10 | 0x80))
-    {
-        std::ostringstream oss;
-        oss << "MODBUS ERROR: Exception code 0x" << std::hex << (int)response[2] << std::dec;
-        errorMessage = oss.str();
-        return false;
-    }
-
-    if (response[0] != slaveID || response[1] != 0x10)
-    {
-        errorMessage = "0x10 response header mismatch.";
+        errorMessage = "0x10 response echo mismatch.";
         return false;
     }
 
