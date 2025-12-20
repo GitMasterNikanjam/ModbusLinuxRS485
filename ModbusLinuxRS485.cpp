@@ -220,7 +220,6 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
 
     // Flush stale input before request (OK for Modbus RTU).
     tcflush(_serialPort, TCIFLUSH); 
-    tcdrain(_serialPort); 
 
     size_t sent = 0;
     while (sent < len)
@@ -239,7 +238,13 @@ bool Modbus::_serialSend(const uint8_t* data, size_t len)
     }
 
     // Ensure request is physically transmitted before turnaround delay.
-    tcdrain(_serialPort);
+    if (tcdrain(_serialPort) != 0)
+    {
+        std::ostringstream oss;
+        oss << "tcdrain failed: " << std::strerror(errno);
+        errorMessage = oss.str();
+        return false;
+    }
 
     if (parameters.TRANSMIT_DELAY_US > 0)
     {
