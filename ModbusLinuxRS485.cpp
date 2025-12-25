@@ -750,7 +750,11 @@ bool Modbus::writeSingleRegister(uint8_t slaveID, uint16_t starting_address, uin
     // }
 
     auto response = _receiveRtuResponse(slaveID, 0x06, 8, parameters.RESPONSE_TIMEOUT_MS);
-    if (response.empty()) return false;   // errorMessage already set
+    if (response.empty()) 
+    {
+        errorMessage = "Modbus response is empty.";
+        return false;   // errorMessage already set 
+    }
 
 
     // if (!_verifyCrc(response))
